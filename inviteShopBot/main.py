@@ -6,6 +6,7 @@ import aiosqlite
 import ast
 from collections import defaultdict
 from discord import app_commands
+import json
 
 from discord import Embed
 
@@ -31,6 +32,7 @@ async def on_ready():
     print("Registered commands:")
     for command in bot.tree.get_commands():
         print(command.name)
+
     await bot.tree.sync()
     await get_plans()
     print(f'We have logged in as {bot.user}')
@@ -70,7 +72,16 @@ async def on_ready():
                     
                 except Exception as e:
                     print(f"Error processing invites for guild {guild.name}: {e}")
-                    
+    await update_shop(False)
+class ShopView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)  # Make it persistent
+        self.add_item(GuideButton())
+        self.add_item(BalanceButton())
+
+        # Add category buttons (1-5)
+        for i in range(1, 6):
+            self.add_item(CategorySelect(emoji=f"{i}️⃣", value=i))                   
 
 @bot.event
 async def on_message(message):
@@ -233,84 +244,136 @@ async def setshop(interaction:discord.Interaction):
     print('Shop has been set.')
     await update_shop(True, interaction=interaction)
 
-async def update_shop(new: bool, interaction=None):
-    async with aiosqlite.connect('shop.db') as db:
-        async with db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';") as cursor:
-            tables = await cursor.fetchall()
 
+SHOP_MESSAGE_FILE = "shop_messages.json"
+
+async def save_shop_message(guild_id, channel_id, message_id):
+    try:
+        with open(SHOP_MESSAGE_FILE, "r") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    data[str(guild_id)] = {"channel_id": channel_id, "message_id": message_id}
+
+    with open(SHOP_MESSAGE_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+        
+async def get_shop_message(guild_id):
+    try:
+        with open(SHOP_MESSAGE_FILE, "r") as f:
+            data = json.load(f)
+        return data.get(str(guild_id))  
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+async def get_all_shop_messages():
+    """Retrieve all saved shop messages for all guilds."""
+    try:
+        with open(SHOP_MESSAGE_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}  # Return an empty dict if the file is missing/corrupt
+
+async def update_shop(new: bool, interaction:discord.Interaction=None):
     global embed
-    global msg
     embed = Embed(
         color=discord.Color.dark_blue(),
         title='💰 Welcome to the `Invite Shop` 💰',
         description="Click on a category to see available items! Check your balance with the 🪙 button.\nConfused? Click on the 📝!"
     )
 
-    table_count = 0
+    async with aiosqlite.connect('shop.db') as db:
+        async with db.execute("SELECT name FROM sqlite_master WHERE type='table';") as cursor:
+            tables = await cursor.fetchall()
+
     category_buttons = []
-    
-    for table in tables[:5]:
+    visible_count = 0  # Track the number of displayed categories
+
+    for table in tables:
+        if visible_count >= 5:  # Ensure we only show up to 5 categories
+            break
+
         category = table[0]
+        if category == "sqlite_sequence":
+            continue
 
         async with aiosqlite.connect('shop.db') as db:
             async with db.execute(f"SELECT * FROM {category} WHERE hidden = 0") as cursor:
                 items = await cursor.fetchall()
 
-        if not items:
+        if not items:  # Skip empty tables
             continue
 
-        table_count += 1
-        embed.add_field(name="", value="", inline=False)
-        embed.add_field(name=f"\n`{table_count}.` {category}!", value="", inline=False)
+        visible_count += 1  # Only count categories that have items
 
-        count = 0
+        embed.add_field(name="", value="", inline=False)
+        embed.add_field(name=f"\n`{visible_count}.` {category}!", value="", inline=False)
+
         item_grouped = {}
 
         for item in items:
             item_id, item_name, item_reward, item_cost, item_hidden = item
-            
+
             if item_name not in item_grouped:
                 item_grouped[item_name] = {
                     'cost': item_cost,
                     'stock': 0
                 }
-            
+
             item_grouped[item_name]['stock'] += 1
 
         for item_name, details in list(item_grouped.items())[:5]:
-            count += 1
             embed.add_field(
                 name=f"`{item_name}`🛒",
                 value=f"\n> Cost: `{details['cost']}` 🪙\n> Stock: `{details['stock']}` ",
                 inline=True
             )
 
-        embed.add_field(name="", value=f"*Click `{table_count}` to view more items in this category.*", inline=True)
+        embed.add_field(name="", value=f"*Click `{visible_count}` to view more items in this category.*", inline=True)
 
         category_buttons.append(
-            CategorySelect(style=discord.ButtonStyle.blurple, emoji=f"{table_count}️⃣", tables=tables, value=table_count)
+            CategorySelect(style=discord.ButtonStyle.blurple, emoji=f"{visible_count}️⃣", tables=tables, value=visible_count)
         )
 
     guide_button = GuideButton()
     balance_button = BalanceButton()
 
     view = View()
-
     for button in category_buttons:
         view.add_item(button)
-    
+
     view.add_item(guide_button)
     view.add_item(balance_button)
 
+    shop_data = await get_all_shop_messages()
+
     if new:
+        guild_id = interaction.guild_id
         msg = await interaction.channel.send(embed=embed, view=view)
-    else:
-        if msg is None:
-            await interaction.channel.send("Please call /setshop.")
-        else:
+        await save_shop_message(guild_id, interaction.channel.id, msg.id)
+        return
+
+    for guild_id, data in shop_data.items():
+        guild = bot.get_guild(int(guild_id))
+        if not guild:
+            print(f"Bot is no longer in guild {guild_id}, skipping...")
+            continue
+
+        channel_id, message_id = data["channel_id"], data["message_id"]
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            print(f"Channel {channel_id} not found in guild {guild_id}, skipping...")
+            continue
+
+        try:
+            msg = await channel.fetch_message(message_id)
             await msg.edit(embed=embed, view=view)
-        print("Tried to edit the shop.")
-   
+            print(f"Shop updated for guild {guild_id}.")
+        except discord.NotFound:
+            print(f"Shop message {message_id} not found in guild {guild_id}. It may have been deleted.")
+        except discord.Forbidden:
+            print(f"Missing permissions to edit message {message_id} in guild {guild_id}.")
+
 
 class PurchaseDropdown(Select):
     def __init__(self, items, category):
@@ -339,7 +402,7 @@ class PurchaseDropdown(Select):
 
 class CategorySelect(Button):
     def __init__(self, style, emoji, tables, value):
-        super().__init__(style=style, emoji=emoji)
+        super().__init__(style=style, emoji=emoji, custom_id=f"category_{value - 1}")
         self.tables = tables
         self.value = value - 1  # Adjust for 0-based index
 
@@ -502,7 +565,7 @@ class TableConfirmButton(Button):
 
 class GuideButton(Button):
     def __init__(self):
-        super().__init__(style=discord.ButtonStyle.gray, emoji='📝')
+        super().__init__(style=discord.ButtonStyle.gray, emoji='📝', custom_id="guide_button")
     async def callback(self, interaction):
         await interaction.response.send_message("**How does this bot work?**\nThis shop operates with `Invite Tokens`.\n\nYou gain these tokens by inviting new users to this server.\n\n**How do I invite people to the server?**\n-Click the dropdown next to the servers name in the top left.\n-Next, click `Invite People`.\n-Click any user on your friends list. \n-As soon as a new user accepts one of your invites, you will be automatically awarded with currency!\n\n**How do I see how much money I have?**\nClick the 🪙 button underneath the shop.\n\n**Where is my purchase?**\n-To maintain security, all purchase codes are sent to your DM's. If you didn't get a message, its likely you have set 'Allow DM's from other server member' to false. Don't worry, you have been refunded.\n\n**My question isn't listed!**\n-Please message `thedapperlad` any further questions you have.", ephemeral=True)
 class Next(Button):
