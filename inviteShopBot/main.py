@@ -1,9 +1,11 @@
 import discord
 from datetime import datetime, timezone
 from discord.ext import commands
-from discord.ui import Button, View
+from discord.ui import Button, View, Select
 import aiosqlite
+import ast
 from collections import defaultdict
+from discord import app_commands
 
 from discord import Embed
 
@@ -11,22 +13,29 @@ token = "MTM0MzM4MjQ5ODkxODQwNDIyNg.GeyYtG.lJ_lPBPNvxfZuZIV5ffaKsUdjoXEzMGsZ9WT1
 
 admin = [1229197671839826037, 456225181107486721]
 
+invite_shop_helper = 1342337584860233788
+
+subscription_plans = {}
 embed = None
 msg = None
 multiplier = 10
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='/', intents=intents)
 
+
 INVITE_FILE = 'main/invites.txt'
 
 
 @bot.event
 async def on_ready():
+    print("Registered commands:")
+    for command in bot.tree.get_commands():
+        print(command.name)
     await bot.tree.sync()
+    await get_plans()
     print(f'We have logged in as {bot.user}')
     async with aiosqlite.connect("user_invites.db") as db:
         async with db.cursor() as cursor:
-            await cursor.execute("DROP TABLE IF EXISTS users") #delete later
             await cursor.execute('CREATE TABLE IF NOT EXISTS users (row_id INTEGER PRIMARY KEY AUTOINCREMENT, id INTEGER, name STRING, invites INTEGER, guild INTEGER, coins INTEGER, UNIQUE (id, guild))')
         await db.commit()
         
@@ -62,11 +71,62 @@ async def on_ready():
                 except Exception as e:
                     print(f"Error processing invites for guild {guild.name}: {e}")
                     
-@bot.tree.command(name="fart") #delete later
-async def fart(interaction:discord.Interaction):
-    await interaction.response.send_message("i farted!1")
 
+@bot.event
+async def on_message(message):
+    global subscription_plans
+    
+    if message.author.id != invite_shop_helper:
+        return
+    if message.content.startswith("<PLANS>"):
+        sub_plans = message.content[7:]
+        data_dict = ast.literal_eval(sub_plans)
+        subscription_plans = data_dict
+        await bot.tree.sync()
+    if message.content.startswith("<PAYMENT_DETAILS>"):
+        message_info = message.content.split('|')
+        user_id = int(message_info[1]) 
+        selected_plan = message_info[2]
+        shop_cost = int(message_info[3])
+        count = int(message_info[4])
+        status = message_info[5]
+        
+        if status == "False":
+            user = await bot.fetch_user(user_id)
+            await user.send("Purchase Failed. Please Try again later.")
+        else:
+            user = await bot.fetch_user(user_id)
+            await user.send("Purchase success!")
+            async with aiosqlite.connect('shop.db') as db:
 
+                async with db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name = 'Nitro';") as cursor:
+                    table = await cursor.fetchone()
+
+                if table is None:
+                    await db.execute("""
+                        CREATE TABLE Nitro (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            item_name TEXT NOT NULL,
+                            item_reward TEXT NOT NULL,
+                            cost INTEGER NOT NULL,
+                            hidden INTEGER NOT NULL
+                        );
+                    """)
+                    await db.commit()
+
+                for i in range(count):
+                    await db.execute(
+                        "INSERT INTO Nitro (item_name, item_reward, cost, hidden) VALUES (?, ?, ?, ?)",
+                        (selected_plan, f"Nitro_Gift_{selected_plan}", shop_cost, 0)  
+                    )
+                await db.commit()
+
+            await update_shop(False)
+            
+            print(f"Item `{selected_plan}` added {count} times to the Nitro table with cost `{shop_cost}`.")
+            
+        
+ 
 @bot.event
 async def on_guild_join(guild):
     print('joined new guild')
@@ -84,44 +144,52 @@ async def on_member_join(member):
     inviteTracking = {}
     user = None
     new_member = False
+    row_id = None  # Track the new row_id
     
     for invite in invites:
         inviteTracking[invite.inviter.id] = inviteTracking.get(invite.inviter.id, 0) + invite.uses
     print(inviteTracking)
+    
     async with aiosqlite.connect("user_invites.db") as db:
         async with db.cursor() as cursor:
             await cursor.execute("SELECT id, invites FROM users WHERE guild = ?", (guild_id,))
             db_users = await cursor.fetchall()
             
-            #list of tuples
+            # Find who invited the new member
             for user_id, db_invites in db_users:
                 if user_id in inviteTracking:
                     new_invites = inviteTracking[user_id]
-                    print(f"{db_invites} fart {new_invites}")
                     if db_invites < new_invites:
-                        print(f"User {user_id} has fewer invites in the database ({db_invites}) than in the new data ({new_invites})")
-                        user = user_id #this is the user of who invited the new member. it is now not set to none, and currency will be awarded
+                        print(f"User {user_id} has fewer invites in DB ({db_invites}) than in the new data ({new_invites})")
+                        user = user_id  # This is the inviter
                         await cursor.execute("""
-                        UPDATE users
-                        SET invites = ?
-                        WHERE id = ? AND guild = ?
-                    """, (new_invites, user_id, guild_id))
+                            UPDATE users
+                            SET invites = ?
+                            WHERE id = ? AND guild = ?
+                        """, (new_invites, user_id, guild_id))
                         
-            await cursor.execute("SELECT id FROM users WHERE id = ? AND guild = ?", (member.id, guild_id)) #counts as new user if the user isnt in this 
+            # Check if the new member is already in the database
+            await cursor.execute("SELECT rowid FROM users WHERE id = ? AND guild = ?", (member.id, guild_id))
             db_member = await cursor.fetchone()
             
-            if db_member is None:  # If the member doesn't exist in the database, add them
+            if db_member is None:  # If the member doesn't exist, insert them and get rowid
                 new_member = True
                 print(f"Adding new user {member.id} to the database")
+                
                 await cursor.execute("""
                     INSERT INTO users (id, name, invites, guild, coins)
                     VALUES (?, ?, 0, ?, 0)
                 """, (member.id, member.name, guild_id))
+
+                # Fetch the last inserted rowid
+                await cursor.execute("SELECT last_insert_rowid()")
+                row_id = (await cursor.fetchone())[0]
+                print(f"New row_id for {member.id} is {row_id}")
                     
             await db.commit()
 
-    
-    if user != None and new_member:
+    # Award coins if user invited the new member
+    if user is not None and new_member:
         print(f"{user} gained currency")
         coins = 1 * multiplier
         async with aiosqlite.connect("user_invites.db") as db:
@@ -133,7 +201,9 @@ async def on_member_join(member):
                 """, (coins, user, guild_id,))
             await db.commit()
     else: 
-        print('no valid user found')
+        print('No valid user found')
+
+
     
     
 @bot.event
@@ -154,47 +224,50 @@ async def on_invite_create(invite): #refreshes the table everytime a new invite 
         await db.commit()
 
         
-@bot.command()
-async def setshop(ctx):
+@bot.tree.command(name="setshop")
+async def setshop(interaction:discord.Interaction):
+    if interaction.user.id not in admin:
+        await interaction.response.send_message(f"This command is reserved for admins.", ephemeral=True)
+        return
+    await interaction.response.send_message("Shop created", ephemeral=True)
     print('Shop has been set.')
-    
-            
+    await update_shop(True, interaction=interaction)
+
+async def update_shop(new: bool, interaction=None):
     async with aiosqlite.connect('shop.db') as db:
-        async with db.execute("SELECT name FROM sqlite_master WHERE type='table';") as cursor:
+        async with db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';") as cursor:
             tables = await cursor.fetchall()
-    
-    
+
     global embed
     global msg
     embed = Embed(
         color=discord.Color.dark_blue(),
-        title='💰 Welcome to the `Invite Shop`! 💰',
-        description="Click on buttons 1-5 to choose a category! Check your balance with the 🪙 button.\nConfused? Click on the 📝!"
-        )
-    
+        title='💰 Welcome to the `Invite Shop` 💰',
+        description="Click on a category to see available items! Check your balance with the 🪙 button.\nConfused? Click on the 📝!"
+    )
+
     table_count = 0
-    for table in tables:
+    category_buttons = []
+    
+    for table in tables[:5]:
         category = table[0]
-        if category == "sqlite_sequence":  #idk why i need this but stack overflow told me to :pray:
-            continue
-        table_count += 1
+
         async with aiosqlite.connect('shop.db') as db:
-            async with db.execute(f"SELECT * FROM {category}") as cursor:
+            async with db.execute(f"SELECT * FROM {category} WHERE hidden = 0") as cursor:
                 items = await cursor.fetchall()
+
+        if not items:
+            continue
+
+        table_count += 1
         embed.add_field(name="", value="", inline=False)
         embed.add_field(name=f"\n`{table_count}.` {category}!", value="", inline=False)
-        
-        
 
         count = 0
         item_grouped = {}
 
-        # Group items by name and count occurrences
         for item in items:
             item_id, item_name, item_reward, item_cost, item_hidden = item
-            
-            if item_hidden == 1:
-                continue
             
             if item_name not in item_grouped:
                 item_grouped[item_name] = {
@@ -204,74 +277,87 @@ async def setshop(ctx):
             
             item_grouped[item_name]['stock'] += 1
 
-        # Add fields to the embed for each unique item
-        for item_name, details in item_grouped.items():
+        for item_name, details in list(item_grouped.items())[:5]:
             count += 1
             embed.add_field(
-                name=f"Item {count}: {item_name}",
-                value=f"\nCost: `{details['cost']}` 🪙\nStock: {details['stock']} ",
+                name=f"`{item_name}`🛒",
+                value=f"\n> Cost: `{details['cost']}` 🪙\n> Stock: `{details['stock']}` ",
                 inline=True
             )
-        embed.add_field(name="", value=f"*Click the* `{table_count}` *button*\n*to buy something from*\n*this category.*", inline=True)
 
-    
-    button1 = CategorySelect(style=discord.ButtonStyle.blurple, emoji='1️⃣', tables=tables, value=1)
-    button2 = CategorySelect(style=discord.ButtonStyle.blurple, emoji='2️⃣', tables=tables,value=2)
-    button3 = CategorySelect(style=discord.ButtonStyle.blurple, emoji='3️⃣', tables=tables,value=3)
-    button4 = CategorySelect(style=discord.ButtonStyle.blurple, emoji='4️⃣', tables=tables, value=4)
-    button5 = CategorySelect(style=discord.ButtonStyle.blurple, emoji='5️⃣', tables=tables,value=5)
+        embed.add_field(name="", value=f"*Click `{table_count}` to view more items in this category.*", inline=True)
+
+        category_buttons.append(
+            CategorySelect(style=discord.ButtonStyle.blurple, emoji=f"{table_count}️⃣", tables=tables, value=table_count)
+        )
+
     guide_button = GuideButton()
     balance_button = BalanceButton()
-    
+
     view = View()
 
-    view.add_item(button1)
-    view.add_item(button2)
-    view.add_item(button3)
-    view.add_item(button4)
-    view.add_item(button5)
+    for button in category_buttons:
+        view.add_item(button)
+    
     view.add_item(guide_button)
     view.add_item(balance_button)
-    
-    
-    
-    
 
-    msg = await ctx.channel.send(embed=embed, view=view)
-    
-    await update_shop(ctx)
+    if new:
+        msg = await interaction.channel.send(embed=embed, view=view)
+    else:
+        if msg is None:
+            await interaction.channel.send("Please call /setshop.")
+        else:
+            await msg.edit(embed=embed, view=view)
+        print("Tried to edit the shop.")
+   
 
-async def update_shop(ctx):
-    global embed
-    #embed.add_field(name="Sorry! Shop is currently empty, please come back later.", value="0", inline=True)
-    
-    await msg.edit(embed=embed)
-    
+class PurchaseDropdown(Select):
+    def __init__(self, items, category):
+        options = [
+            discord.SelectOption(label=item_name, value=str(item_id), description=f"Cost: {details['cost']} 🪙 | Stock: {details['stock']}")
+            for item_id, (item_name, details) in enumerate(items.items(), start=1)
+        ]
+
+        super().__init__(placeholder="Select an item to purchase...", min_values=1, max_values=1, options=options)
+        self.items = items
+        self.category = category
+
+    async def callback(self, interaction):
+        selected_id = int(self.values[0])
+        item_name = list(self.items.keys())[selected_id - 1]
+        details = self.items[item_name]
+
+        # Process the purchase logic here (you might want to replace this with a proper function)
+        view =  View()
+        confirm_button = ShopConfirmButton(self.category, details['item_id'], details['cost'], item_name)
+        deny_button = DenyButton()
+        view.add_item(confirm_button)
+        view.add_item(deny_button)
+        await interaction.response.send_message(f"You are trying to purchase {item_name} for {details['cost']}. Are you sure you want to do this?", view=view, ephemeral=True)
+
 
 class CategorySelect(Button):
     def __init__(self, style, emoji, tables, value):
         super().__init__(style=style, emoji=emoji)
         self.tables = tables
         self.value = value - 1  # Adjust for 0-based index
-    
+
     async def callback(self, interaction):
-        embed = Embed(
+        embed = discord.Embed(
             color=discord.Color.dark_blue(),
             title='`Available for Purchase`:',
             description=""
         )
 
         # Fetch the correct category based on the button clicked
-        category = self.tables[self.value]
-        category = category[0]
+        category = self.tables[self.value][0]
         print(category)
         async with aiosqlite.connect('shop.db') as db:
             try:
-                # Using parameterized queries to avoid SQL injection
                 async with db.execute(f"SELECT * FROM {category}") as cursor:
                     items = await cursor.fetchall()
 
-                count = 0
                 item_grouped = {}
                 for item in items:
                     item_id, item_name, item_reward, item_cost, item_hidden = item
@@ -288,79 +374,109 @@ class CategorySelect(Button):
                     
                     item_grouped[item_name]['stock'] += 1
 
-                
-                
-                item_cost_dict = {}
-                item_name_dict = {}
-                item_id_dict = {}  
-                for item_name, details in item_grouped.items():
-                    count += 1
-                    item_cost_dict[count] = details['cost']  
-                    item_name_dict[count] = item_name
-                    item_id_dict[count] = details['item_id'] 
+                # Populate the embed with available items
+                for count, (item_name, details) in enumerate(item_grouped.items(), start=1):
                     embed.add_field(
-                        name=f" | Item `{count}`: {item_name} | ",
+                        name=f" Item `{count}`: {item_name}    ",
                         value=f"Cost: `{details['cost']}` 🪙\nStock: {details['stock']} ",
                         inline=True
                     )
-                
-                embed.add_field(name="", value=f"Click the item number to purchase.", inline=True)
 
-                # add purchase buttons for each item
-                button1 = PurchaseButton(style=discord.ButtonStyle.blurple, emoji='1️⃣', item_cost=item_cost_dict.get(1), item_name=item_name_dict.get(1), item_id=item_id_dict.get(1), category=category)
-                button2 = PurchaseButton(style=discord.ButtonStyle.blurple, emoji='2️⃣', item_cost=item_cost_dict.get(2), item_name=item_name_dict.get(2), item_id=item_id_dict.get(2), category=category)
-                button3 = PurchaseButton(style=discord.ButtonStyle.blurple, emoji='3️⃣', item_cost=item_cost_dict.get(3), item_name=item_name_dict.get(3), item_id=item_id_dict.get(3), category=category)
-                button4 = PurchaseButton(style=discord.ButtonStyle.blurple, emoji='4️⃣', item_cost=item_cost_dict.get(4), item_name=item_name_dict.get(4), item_id=item_id_dict.get(4), category=category)
-                button5 = PurchaseButton(style=discord.ButtonStyle.blurple, emoji='5️⃣', item_cost=item_cost_dict.get(5), item_name=item_name_dict.get(5), item_id=item_id_dict.get(5), category=category)
-                
                 view = View()
-                view.add_item(button1)
-                view.add_item(button2)
-                view.add_item(button3)
-                view.add_item(button4)
-                view.add_item(button5)
-                
+                view.add_item(PurchaseDropdown(item_grouped, category))
+
                 await interaction.response.send_message(f"Here are the items available for purchase in the `{category}` category:", embed=embed, view=view, ephemeral=True)
+
             except Exception as e:
                 print(f"Error fetching items from category {category}: {e}")
                 await interaction.response.send_message(f"An error occurred while fetching items from the category `{category}`.", ephemeral=True)
 
 
-class PurchaseButton(Button):
-    global item_cost
-    global item_name
-    global item_id
-    global category
-    
-    def __init__(self, style, emoji, item_cost, item_name, item_id, category):
-        super().__init__(style=style,emoji=emoji)
+class ShopConfirmButton(Button):
+    def __init__(self, category, line_id, item_cost, item_name):
+        super().__init__(style=discord.ButtonStyle.green, emoji='✅')
+        self.category = category 
+        self.line_id = line_id 
         self.item_cost = item_cost
         self.item_name = item_name
-        self.item_id = item_id
-        self.category = category
-        
-    
-    async def callback(self, interaction):
-        print(f'value={self.item_id}')
-        
-        view =  View()
-        confirm_button = ShopConfirmButton(self.category, self.item_id)
-        deny_button = DenyButton()
-        view.add_item(confirm_button)
-        view.add_item(deny_button)
-        await interaction.response.send_message(f"You are trying to purchase {self.item_name} for {self.item_cost}. Are you sure you want to do this?", view=view, ephemeral=True)
 
-class ShopConfirmButton(Button):
-    global line_id
-    global category
-    def __init__(self, category, line_id):
-        super().__init__(style=discord.ButtonStyle.green, emoji='✅')
-        self.category = category
-        self.line_id = line_id
-        
     async def callback(self, interaction):
-        await interaction.response.send_message("Purchase successful!", ephemeral=True)
-        await delete_line(self.category, self.line_id)
+        user_id = interaction.user.id
+
+        async with aiosqlite.connect('user_invites.db') as db:
+            async with db.execute("SELECT coins FROM users WHERE id = ?", (user_id,)) as cursor:
+                result = await cursor.fetchone()
+
+        if result is None:
+            await interaction.response.send_message("You don't have an account yet. Try clicking the help button on the shop to get started.", ephemeral=True)
+            return
+
+        user_balance = result[0]
+
+        if user_balance < self.item_cost:
+            await interaction.response.send_message("You don't have enough coins to buy this item. Click the 🪙 button on the shop to check your balance.", ephemeral=True)
+            return
+
+        #fetch reward
+        async with aiosqlite.connect('shop.db') as db:
+            async with db.execute(f"SELECT item_reward FROM {self.category} WHERE id = ?", (self.line_id,)) as cursor:
+                reward_result = await cursor.fetchone()
+
+        if reward_result is None:
+            await interaction.response.send_message("This item does not exist anymore.", ephemeral=True)
+            return
+
+        item_reward = reward_result[0] 
+
+        #deduct moneys and update the db
+        new_balance = user_balance - self.item_cost
+        async with aiosqlite.connect('user_invites.db') as db:
+            await db.execute("UPDATE users SET coins = ? WHERE id = ?", (new_balance, user_id))
+            await db.commit()
+
+        # Send confirmation message with the reward
+        try:
+            await interaction.response.send_message("Purchase successful. Please check your DM's", ephemeral=True)
+            await interaction.user.send(
+                f"Purchase successful! You bought `{self.item_name}` for `{self.item_cost}` 🪙.\n"
+                f"You received: `{item_reward}` 🎁.\n"
+                f"Your new balance is `{new_balance}` 🪙.",
+            )
+            #if item reward is Nitro_Gift_ then call "Gift Nitro" method
+            if item_reward[:11] == "Nitro_Gift_":
+                await gift_nitro(interaction.user.id, self.item_name)
+        except discord.Forbidden:
+            #in case user has dms disabled
+            await interaction.response.send_message(
+                "Purchase failed. Please allow 'Safe Direct Messaging' in your user settings.",
+                ephemeral=True
+            )
+            new_balance = user_balance + self.item_cost #give money back
+            async with aiosqlite.connect('user_invites.db') as db:
+                await db.execute("UPDATE users SET coins = ? WHERE id = ?", (new_balance, user_id))
+                await db.commit()
+                return
+        except discord.HTTPException as e:
+            await interaction.response.send_message(
+                f"Purchase failed. Please try again later.",
+                ephemeral=True
+            )
+            new_balance = user_balance + self.item_cost #give money backl
+            async with aiosqlite.connect('user_invites.db') as db:
+                await db.execute("UPDATE users SET coins = ? WHERE id = ?", (new_balance, user_id))
+                await db.commit()
+                return
+            return
+        
+        await delete_line(self.category, self.line_id)  # Remove item from stock
+
+async def gift_nitro(user_id: int, selected_plan:str):
+    helper = await bot.fetch_user(invite_shop_helper)
+    await helper.send(f"/gift|{user_id}|{selected_plan}")
+    print("tried gifting nitro")
+    
+    
+
 class DenyButton(Button):
     def __init__(self):
         super().__init__(style=discord.ButtonStyle.red, emoji='✖️')
@@ -388,7 +504,7 @@ class GuideButton(Button):
     def __init__(self):
         super().__init__(style=discord.ButtonStyle.gray, emoji='📝')
     async def callback(self, interaction):
-        await interaction.response.send_message("**How does this bot work?**\nThis shop operates with `Invite Tokens`.\n\nYou gain these tokens by inviting new users to this server.\n\n**How do I invite people to the server?**\n-Click the dropdown next to the servers name in the top left.\n-Next, click `Invite People`.\n-Click any user on your friends list. \n-As soon as a new user accepts one of your invites, you will be automatically awarded with currency!\n\nIt's that simple, good luck!", ephemeral=True)
+        await interaction.response.send_message("**How does this bot work?**\nThis shop operates with `Invite Tokens`.\n\nYou gain these tokens by inviting new users to this server.\n\n**How do I invite people to the server?**\n-Click the dropdown next to the servers name in the top left.\n-Next, click `Invite People`.\n-Click any user on your friends list. \n-As soon as a new user accepts one of your invites, you will be automatically awarded with currency!\n\n**How do I see how much money I have?**\nClick the 🪙 button underneath the shop.\n\n**Where is my purchase?**\n-To maintain security, all purchase codes are sent to your DM's. If you didn't get a message, its likely you have set 'Allow DM's from other server member' to false. Don't worry, you have been refunded.\n\n**My question isn't listed!**\n-Please message `thedapperlad` any further questions you have.", ephemeral=True)
 class Next(Button):
     global index 
     def __init__(self):
@@ -421,11 +537,13 @@ async def delete_table(category: str):
         async with db.cursor() as cursor:
             await cursor.execute(f"DROP TABLE {category}")
             await db.commit()
+    await update_shop(False)
 async def delete_line(category: str, line_id: int):
     async with aiosqlite.connect("shop.db") as db:
         async with db.cursor() as cursor:
             await cursor.execute(f"DELETE FROM {category} WHERE id = ?", (line_id,))
             await db.commit()
+    await update_shop(False)
 
     
 @bot.tree.command(name="insert", description="Ex: Giftcards Giftcard xyz,abc,qwe, 15 False")
@@ -476,7 +594,7 @@ async def insert(interaction:discord.Interaction, category: str, item_type: str,
             if hidden_bool == 1:
                 hidden_text = "HIDDEN"
             await interaction.response.send_message(f"{len(codes)} items of '{item_type}' type have been added to the '{category}' category. The cost is {cost} and the item is currently {hidden_text}.")
-            #call edit shop function
+    await update_shop(False)
             
 @bot.tree.command(name="display")
 async def display(interaction:discord.Interaction, category: str = None):
@@ -528,6 +646,13 @@ async def display(interaction:discord.Interaction, category: str = None):
     
 @bot.tree.command(name="edit", description="Edit a specific items information.")
 async def edit(interaction:discord.Interaction, category: str, line_id: int, new_item:str, new_reward:str, new_cost:int):
+    if interaction.channel.type is not discord.ChannelType.private:
+        await interaction.response.send_message(f"This command is reserved for private messages.", ephemeral=True)
+        return
+    if interaction.user.id not in admin:
+        await interaction.response.send_message(f"This command is reserved for admins.")
+        return
+    
     async with aiosqlite.connect("shop.db") as db:
         async with db.cursor() as cursor:
             await cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name = ?", (category,))
@@ -555,10 +680,40 @@ async def edit(interaction:discord.Interaction, category: str, line_id: int, new
             await db.commit()
 
             await interaction.response.send_message(f"Item ID `{line_id}` in '{category}' has been updated:\n- New Item: `{new_item}`\n- New Reward: `{new_reward}`\n- New Cost: `{new_cost}`")
-    #call edit shop function
+    await update_shop(False)
+
+@bot.tree.command(name="coin", description="Given user gets that many coins (dev command)")
+async def coin(interaction:discord.Interaction, name: str, amount: int):
+    if interaction.user.id not in admin:
+        await interaction.response.send_message(f"This command is reserved for admins.")
+        return
+
+    async with aiosqlite.connect('user_invites.db') as db:
+        async with db.execute("SELECT id, coins FROM users WHERE name = ?", (name,)) as cursor:
+            result = await cursor.fetchone()
+    if result is None:
+        await interaction.response.send_message(f"User `{name}` was not found in the database.", ephemeral=True)
+        return
+    user_id, current_balance = result
+    new_balance = current_balance + amount
+
+    async with aiosqlite.connect('user_invites.db') as db:
+        await db.execute("UPDATE users SET coins = ? WHERE id = ?", (new_balance, user_id))
+        await db.commit()
+
+    await interaction.response.send_message(f"Successfully added `{amount}` 🪙 to `{name}`.\nNew balance: `{new_balance}` 🪙.", ephemeral=True)
+    
+    
     
 @bot.tree.command(name="delete", description="Delete the specified table or just a line from that table.")
 async def delete(interaction:discord.Interaction, category: str, line_id: int = None):
+    if interaction.channel.type is not discord.ChannelType.private:
+        await interaction.response.send_message(f"This command is reserved for private messages.", ephemeral=True)
+        return
+    if interaction.user.id not in admin:
+        await interaction.response.send_message(f"This command is reserved for admins.")
+        return
+    
     #delete certain element from table, or entire table if line number isnt provided. prompt user with an "are you sure"
     
     async with aiosqlite.connect("shop.db") as db:
@@ -598,9 +753,18 @@ async def delete(interaction:discord.Interaction, category: str, line_id: int = 
 
                 await interaction.response.send_message(f"Are you sure you want to delete line {line_id} from the '{category}' table? This action cannot be undone.", view=view, ephemeral=True)
                 return
+            
+        
     
 @bot.tree.command(name="toggle", description="Items with the 'Hidden' attribute do not appear in the shop.")
 async def toggle(interaction:discord.Interaction, category: str, hidden:bool, line_id: int = None):
+    if interaction.channel.type is not discord.ChannelType.private:
+        await interaction.response.send_message(f"This command is reserved for private messages.", ephemeral=True)
+        return
+    if interaction.user.id not in admin:
+        await interaction.response.send_message(f"This command is reserved for admins.")
+        return
+    
     #toggle certain element from table, or entire table if line number isnt provided. 
     hidden_bool = 1 if hidden else 0
 
@@ -632,14 +796,64 @@ async def toggle(interaction:discord.Interaction, category: str, hidden:bool, li
                 await db.commit()
                 status = "HIDDEN" if hidden else "NOT HIDDEN"
                 await interaction.response.send_message(f"Line {line_id} has been marked as {status}.", ephemeral=True)
-
-
-async def insert_shop_item(ctx):
-    global embed
-    embed.add_field(name="Test item", value="Description of test item", inline=False)
+    await update_shop(False)
+                
+                
+@bot.tree.command(name = "plans")
+async def plans(interaction:discord.Interaction):
+    global subscription_plans
     
-    await msg.edit(embed=embed)
+    if interaction.channel.type is not discord.ChannelType.private:
+        await interaction.response.send_message(f"This command is reserved for private messages.", ephemeral=True)
+        return
+    if interaction.user.id not in admin:
+        await interaction.response.send_message(f"This command is reserved for admins.")
+        return
+    formatted_text = "\n".join([f"**{key}**: `{value}`" for key, value in subscription_plans.items()])
+    await interaction.response.send_message(f"Here are the available plans:\n{formatted_text}") 
+    await get_plans()
     
+    
+async def get_plans():
+    helper = await bot.fetch_user(invite_shop_helper) 
+    await helper.send("/plans")
+    
+
+@bot.tree.command(name="purchase", description="Purchase an item")
+async def purchase(interaction: discord.Interaction, amount: int, shop_cost: int):
+    # Ensure subscription_plans is not empty
+    if not subscription_plans:
+        await interaction.response.send_message("If you're seeing this this means either `InviteShopBot` or `InviteShopHelper` are not fully online, wait for them to finish booting, or check to see if they're running.", ephemeral=True)
+        return
+
+    # Create SelectOption instances from subscription_plans
+    options = [discord.SelectOption(label=name, value=name) for name in subscription_plans.keys()]
+    
+    # Ensure we have at least one option
+    if not options:
+        await interaction.response.send_message("If you're seeing this this means either InviteShopBot or InviteShopHelper are not fully online, wait for them to finish booting, or check to see if they're running.", ephemeral=True)
+        return
+
+    # Create Select component with options
+    select = Select(placeholder="Choose a subscription plan", options=options)
+    
+    view = View()
+    view.add_item(select)
+    
+    # Callback for selection
+    async def select_callback(interaction: discord.Interaction):
+        selected_plan = select.values[0]
+        await interaction.response.send_message(f"You selected: `{amount}x` of `{selected_plan}`, costing `{shop_cost}` per item. You will recieve a followup message sometime soon, unfortunately the time it takes depends on whether or not discord is ratelimiting us.")
+
+        # Helper processing
+        helper = await bot.fetch_user(invite_shop_helper)
+        sku_id = subscription_plans[selected_plan]
+        await helper.send(f"/purchase|{interaction.user.id}|{selected_plan}|{shop_cost}|{sku_id}|{amount}|")
+
+    select.callback = select_callback
+    
+    # Send initial response with selection view
+    await interaction.response.send_message("Please select a subscription plan:", view=view)
 
 
 bot.run(token)
