@@ -146,7 +146,23 @@ async def on_guild_join(guild):
         await channel.send('Hello! If you\'d like to get started, please type `/setshop` in the appropriate channel.')
     else:
         print("No suitable text channel found to send the message.")
-        
+    
+    async with aiosqlite.connect("user_invites.db") as db:
+        async with db.cursor() as cursor:
+            for member in guild.members:
+                if member.bot:
+                    continue  
+                await cursor.execute("SELECT id FROM users WHERE id = ? AND guild = ?", (member.id, guild.id))
+                result = await cursor.fetchone()
+
+                if result is None:
+                    print(f"Adding {member.name} ({member.id}) to the database.")
+                    await cursor.execute("""
+                        INSERT INTO users (id, name, invites, guild, coins)
+                        VALUES (?, ?, 0, ?, 0)
+                    """, (member.id, member.name, guild.id))
+        await db.commit()
+            
 @bot.event
 async def on_member_join(member): 
     guild = member.guild
@@ -240,10 +256,13 @@ async def setshop(interaction:discord.Interaction):
     if interaction.user.id not in admin:
         await interaction.response.send_message(f"This command is reserved for admins.", ephemeral=True)
         return
-    await interaction.response.send_message("Shop created", ephemeral=True)
-    print('Shop has been set.')
-    await update_shop(True, interaction=interaction)
-
+    try:
+        await update_shop(True, interaction=interaction)
+        await interaction.response.send_message("Shop created", ephemeral=True)
+        print('Shop has been set.')
+    except Exception as e:
+        await interaction.response.send_message("Failed to create shop. Make sure the bot has ", ephemeral=True)
+        print(f'Error setting shop: {e}')
 
 SHOP_MESSAGE_FILE = "shop_messages.json"
 
@@ -258,21 +277,13 @@ async def save_shop_message(guild_id, channel_id, message_id):
     with open(SHOP_MESSAGE_FILE, "w") as f:
         json.dump(data, f, indent=4)
         
-async def get_shop_message(guild_id):
-    try:
-        with open(SHOP_MESSAGE_FILE, "r") as f:
-            data = json.load(f)
-        return data.get(str(guild_id))  
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
-
 async def get_all_shop_messages():
     """Retrieve all saved shop messages for all guilds."""
     try:
         with open(SHOP_MESSAGE_FILE, "r") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {}  # Return an empty dict if the file is missing/corrupt
+        return {}  
 
 async def update_shop(new: bool, interaction:discord.Interaction=None):
     global embed
@@ -332,7 +343,7 @@ async def update_shop(new: bool, interaction:discord.Interaction=None):
         embed.add_field(name="", value=f"*Click `{visible_count}` to view more items in this category.*", inline=True)
 
         category_buttons.append(
-            CategorySelect(style=discord.ButtonStyle.blurple, emoji=f"{visible_count}️⃣", tables=tables, value=visible_count)
+            CategorySelect(style=discord.ButtonStyle.blurple, emoji=f"{visible_count}️⃣", category=category, value=visible_count)
         )
 
     guide_button = GuideButton()
@@ -401,10 +412,9 @@ class PurchaseDropdown(Select):
 
 
 class CategorySelect(Button):
-    def __init__(self, style, emoji, tables, value):
+    def __init__(self, style, emoji, category, value):
         super().__init__(style=style, emoji=emoji, custom_id=f"category_{value - 1}")
-        self.tables = tables
-        self.value = value - 1  # Adjust for 0-based index
+        self.category = category
 
     async def callback(self, interaction):
         embed = discord.Embed(
@@ -414,11 +424,10 @@ class CategorySelect(Button):
         )
 
         # Fetch the correct category based on the button clicked
-        category = self.tables[self.value][0]
-        print(category)
+        print(self.category)
         async with aiosqlite.connect('shop.db') as db:
             try:
-                async with db.execute(f"SELECT * FROM {category}") as cursor:
+                async with db.execute(f"SELECT * FROM {self.category}") as cursor:
                     items = await cursor.fetchall()
 
                 item_grouped = {}
@@ -446,13 +455,13 @@ class CategorySelect(Button):
                     )
 
                 view = View()
-                view.add_item(PurchaseDropdown(item_grouped, category))
+                view.add_item(PurchaseDropdown(item_grouped, self.category))
 
-                await interaction.response.send_message(f"Here are the items available for purchase in the `{category}` category:", embed=embed, view=view, ephemeral=True)
+                await interaction.response.send_message(f"Here are the items available for purchase in the `{self.category}` category:", embed=embed, view=view, ephemeral=True)
 
             except Exception as e:
-                print(f"Error fetching items from category {category}: {e}")
-                await interaction.response.send_message(f"An error occurred while fetching items from the category `{category}`.", ephemeral=True)
+                print(f"Error fetching items from category {self.category}: {e}")
+                await interaction.response.send_message(f"An error occurred while fetching items from the category `{self.category}`.", ephemeral=True)
 
 
 class ShopConfirmButton(Button):
@@ -745,26 +754,31 @@ async def edit(interaction:discord.Interaction, category: str, line_id: int, new
             await interaction.response.send_message(f"Item ID `{line_id}` in '{category}' has been updated:\n- New Item: `{new_item}`\n- New Reward: `{new_reward}`\n- New Cost: `{new_cost}`")
     await update_shop(False)
 
-@bot.tree.command(name="coin", description="Given user gets that many coins (dev command)")
+@bot.tree.command(name="coin", description="Given user gets that many coins (admin command)")
 async def coin(interaction:discord.Interaction, name: str, amount: int):
     if interaction.user.id not in admin:
-        await interaction.response.send_message(f"This command is reserved for admins.")
+        await interaction.response.send_message("This command is reserved for admins.", ephemeral=True)
         return
 
+    guild_id = interaction.guild_id  
+
     async with aiosqlite.connect('user_invites.db') as db:
-        async with db.execute("SELECT id, coins FROM users WHERE name = ?", (name,)) as cursor:
+        async with db.execute("SELECT id, coins FROM users WHERE name = ? AND guild = ?", (name, guild_id)) as cursor:
             result = await cursor.fetchone()
+
     if result is None:
-        await interaction.response.send_message(f"User `{name}` was not found in the database.", ephemeral=True)
+        await interaction.response.send_message(f"User `{name}` was not found in this guild's database.", ephemeral=True)
         return
     user_id, current_balance = result
     new_balance = current_balance + amount
-
     async with aiosqlite.connect('user_invites.db') as db:
-        await db.execute("UPDATE users SET coins = ? WHERE id = ?", (new_balance, user_id))
+        await db.execute("UPDATE users SET coins = ? WHERE id = ? AND guild = ?", (new_balance, user_id, guild_id))
         await db.commit()
 
-    await interaction.response.send_message(f"Successfully added `{amount}` 🪙 to `{name}`.\nNew balance: `{new_balance}` 🪙.", ephemeral=True)
+    await interaction.response.send_message(
+        f"Successfully added `{amount}` 🪙 to `{name}` in this server.\nNew balance: `{new_balance}` 🪙.",
+        ephemeral=True
+    )
     
     
     
