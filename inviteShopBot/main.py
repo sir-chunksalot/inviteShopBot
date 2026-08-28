@@ -10,7 +10,7 @@ import json
 
 from discord import Embed
 
-token = "MTM0MzM4MjQ5ODkxODQwNDIyNg.GeyYtG.lJ_lPBPNvxfZuZIV5ffaKsUdjoXEzMGsZ9WT1Y"
+token = "token here"
 
 admin = [] #user ids of the admins that are allowed to interact with bot. do /admin to add new admins to json file.
 multiplier = 100 #edit this to edit how many coins a user recieves per invite. 
